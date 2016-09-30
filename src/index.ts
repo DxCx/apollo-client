@@ -1,6 +1,7 @@
 import {
   Request,
   createNetworkInterface,
+  createReactiveNetworkInterface,
   NetworkInterface,
   HTTPFetchNetworkInterface,
 } from './transport/networkInterface';
@@ -83,6 +84,7 @@ import {
 
 export {
   createNetworkInterface,
+  createReactiveNetworkInterface,
   createBatchingNetworkInterface,
   createApolloStore,
   createApolloReducer,
