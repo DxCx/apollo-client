@@ -1,39 +1,39 @@
-import isString = require('lodash.isstring');
-import assign = require('lodash.assign');
-import { Request, RequestAndOptions, ResponseAndOptions, ReactiveNetworkInterface } from './networkInterface';
+import { WebSocket } from './websocket';
+
+import { Request, RequestAndOptions, ResponseAndOptions, SubscriptionNetworkInterface } from './networkInterface';
 import { MiddlewareInterface } from './middleware';
 import { AfterwareInterface } from './afterware';
-import { Observer, Observable } from 'rxjs';
-import * as WebSocket from 'ws';
-import 'rxjs-diff-operator';
+
+import { Observer, Observable } from '../util/Observable';
+import { observableShare } from '../util/ObservableShare';
+// import { Observer, Observable } from 'rxjs';
 
 import {
-  GraphQLResult,
+  ExecutionResult,
 } from 'graphql';
 
-interface CustomWebSocket extends WebSocket {
-    incoming$?: Observable<any>;
-}
-
-export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
+//export class WebsocketNetworkInterface implements SubscriptionNetworkInterface {
+import { NetworkInterface } from './networkInterface';
+export class WebsocketNetworkInterface implements NetworkInterface {
   public _uri: string;
   public _opts: RequestInit;
   public _middlewares: MiddlewareInterface[];
   public _afterwares: AfterwareInterface[];
   private nextReqId: number = 0;
-  private connection$: Observable<CustomWebSocket>;
+  private connection$: Observable<WebSocket>;
+  private incoming$: Observable<any>;
 
-  constructor(uri: string, opts: RequestInit = {}) {
+  constructor(uri: string | undefined, opts: RequestInit = {}) {
     if (!uri) {
       throw new Error('A remote enpdoint is required for a network layer');
     }
 
-    if (!isString(uri)) {
+    if (typeof uri !== 'string') {
       throw new Error('Remote endpoint must be a string');
     }
 
     this._uri = uri;
-    this._opts = assign({}, opts);
+    this._opts = {...opts};
     this._middlewares = [];
     this._afterwares = [];
     this._init_connection();
@@ -49,16 +49,16 @@ export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
           if (funcs.length > 0) {
             const f = funcs.shift();
             try {
-                f.applyMiddleware.apply(scope, [{ request, options }, next]);
+                f && f.applyMiddleware.apply(scope, [{ request, options }, next]);
             } catch (e) {
-                observer.error(e);
+                observer.error && observer.error(e);
             }
           } else {
-            observer.next({
+            observer.next && observer.next({
               request,
               options,
             });
-            observer.complete();
+            observer.complete && observer.complete();
           }
         };
         next();
@@ -66,6 +66,8 @@ export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
 
       // iterate through middlewares using next callback
       queue([...this._middlewares], this);
+
+      return () => { /* noop */ };
     });
   }
 
@@ -81,14 +83,14 @@ export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
             try {
                 f.applyAfterware.apply(scope, [{ response, options }, next]);
             } catch (e) {
-                observer.error(e);
+                observer.error && observer.error(e);
             }
           } else {
-            observer.next({
+            observer.next && observer.next({
               response,
               options,
             });
-            observer.complete();
+            observer.complete && observer.complete();
           }
         };
         next();
@@ -96,38 +98,67 @@ export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
 
       // iterate through afterwares using next callback
       queue([...this._afterwares], this);
+
+      return () => { /* noop */ };
     });
   }
 
   public fetchFromRemoteEndpoint({
     request,
 //    options, # TODO: options in websocket?
-  }: RequestAndOptions): Observable<GraphQLResult> {
-    return this.connection$.retry(3).switchMap((ws) => {
-        return new Observable<GraphQLResult>((observer: Observer<GraphQLResult>) => {
+  }: RequestAndOptions): Observable<ExecutionResult> {
+    return this.connection$.switchMap((ws) => {
+        return new Observable<ExecutionResult>((observer: Observer<ExecutionResult>) => {
             let reqId: number = this.nextReqId ++;
-            ws.send(JSON.stringify(assign({}, request, {
-                id: reqId,
-            })));
+            ws.send(JSON.stringify({...request, id: reqId }));
 
-            let dataSub = ws.incoming$
-            .filter((v) => v.id === reqId)
-            .fromDiff()
-            .subscribe(observer);
+            let dataSub = this.incoming$
+            .filter((v) => (v.id === reqId))
+            .subscribe({
+              next: (v) => {
+                switch ( v.type ) {
+                  case 'data':
+                    return observer.next && observer.next(v.payload);
+                  case 'error':
+                    return observer.error && observer.error(new Error(v.payload));
+                  case 'complete':
+                    return observer.complete && observer.complete();
+                  default:
+                    return observer.error && observer.error(new Error('unexpected message arrived.'));
+                }
+              },
+              error: observer.error && observer.error.bind(observer),
+              complete: observer.complete && observer.complete.bind(observer),
+            });
 
             return () => {
                 if ( ws.readyState === WebSocket.OPEN ) {
-                    ws.send(JSON.stringify({'id': reqId, 'operationName': 'cancel'}));
+                    ws.send(JSON.stringify({'id': reqId, 'type': 'stop'}));
                 }
 
-                dataSub.unsubscribe();
+                if ( dataSub ) {
+                  dataSub.unsubscribe();
+                }
             };
         });
     });
   };
 
-  public query(request: Request): Observable<GraphQLResult> {
-    const options = assign({}, this._opts);
+  public query(request: Request): Promise<ExecutionResult> {
+    return new Promise((resolve, reject) => {
+      const sub = this._query(request).subscribe({
+        next: (v: ExecutionResult) => {
+          resolve(v);
+          process.nextTick(() => sub.unsubscribe());
+        },
+        error: (e: Error) => reject(e),
+        complete: () => resolve(undefined),
+      });
+    });
+  }
+
+  private _query(request: Request): Observable<ExecutionResult> {
+    const options = {...this._opts};
 
     return this.applyMiddlewares({
       request,
@@ -135,19 +166,17 @@ export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
     }).switchMap(this.fetchFromRemoteEndpoint.bind(this))
       .switchMap(result => {
         return this.applyAfterwares({
-          // TODO: How to support same interface...? intersting case.
-          // response: response as IResponse,
-          response: result,
+          response: result as Response,
           options,
         }).map(({response}) => response);
       })
-      .map((payload: GraphQLResult) => {
+      .map((payload: ExecutionResult) => {
         if (!payload.hasOwnProperty('data') && !payload.hasOwnProperty('errors')) {
           throw new Error(
             `Server response was missing for query '${request.debugName}'.`
           );
         } else {
-          return payload as GraphQLResult;
+          return payload as ExecutionResult;
         }
       });
   };
@@ -160,6 +189,8 @@ export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
         throw new Error('Middleware must implement the applyMiddleware function');
       }
     });
+
+    return this;
   }
 
   public useAfter(afterwares: AfterwareInterface[]) {
@@ -170,42 +201,47 @@ export class WebsocketNetworkInterface implements ReactiveNetworkInterface {
         throw new Error('Afterware must implement the applyAfterware function');
       }
     });
+
+    return this;
   }
 
   private _init_connection(): void {
-      this.connection$ = new Observable<CustomWebSocket>((observer: Observer<WebSocket>) => {
-          let ws: CustomWebSocket = new WebSocket(this._uri);
-          ws.incoming$ = new Observable<any>((msgObserver: Observer<any>) => {
-              let onMsg = (msg: any) => {
-                  msgObserver.next(JSON.parse(msg));
-              };
-              ws.on('message', onMsg);
+    this.connection$ = new Observable<WebSocket>((observer: Observer<WebSocket>) => {
+      let ws: WebSocket = new WebSocket(this._uri);
 
-              let statusSub = this.connection$.subscribe(undefined,
-              msgObserver.error.bind(msgObserver),
-              msgObserver.complete.bind(msgObserver));
+      ws.onopen = () => {
+        observer.next && observer.next(ws);
+      };
 
-              return () => {
-                  ws.removeListener('message', onMsg);
-                  statusSub.unsubscribe();
-              };
-          }).share();
+      ws.onerror = () => {
+        observer.error && observer.error(new Error('Websocket Error'));
+      };
 
-          ws.on('open', () => {
-              observer.next(ws);
-          });
+      ws.onclose = (ev: CloseEvent) => {
+        if ( ev.code !== 0 ) {
+          observer.error && observer.error(new Error(`Connection Closed with error: ${ev.code}: ${ev.reason}`));
+        } else {
+          observer.complete && observer.complete();
+        }
+      };
 
-          ws.on('error', (e) => {
-              observer.error(e);
-          });
+      return () => {
+        ws.close();
+      };
+    });
+    this.connection$ = observableShare(this.connection$, 1);
 
-          ws.on('close', () => {
-              observer.complete();
-          });
+    this.incoming$ = observableShare(this.connection$.switchMap((ws) => {
+      return new Observable<any>((observer: Observer<any>) => {
+        let originalOnmessage = ws.onmessage;
+        ws.onmessage = (msg: any) => {
+          observer.next && observer.next(JSON.parse(msg));
+        };
 
-          return () => {
-              ws.close();
-          };
-      }).publishReplay(1).refCount();
+        return () => {
+          ws.onmessage = originalOnmessage;
+        };
+      });
+    }));
   }
 }

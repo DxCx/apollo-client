@@ -5,6 +5,14 @@ import {
   DocumentNode,
 } from 'graphql';
 
+import {
+  parse as urlParse
+} from 'url';
+
+import {
+  WebsocketNetworkInterface,
+} from './websocketNetworkInterface';
+
 import { print } from 'graphql-tag/bundledPrinter';
 
 import {
@@ -17,7 +25,6 @@ import {
   BatchAfterwareInterface,
 } from './afterware';
 
-import { Observable } from 'rxjs';
 /**
  * This is an interface that describes an GraphQL document to be sent
  * to the server.
@@ -54,11 +61,6 @@ export interface NetworkInterface {
 
 export interface BatchedNetworkInterface extends NetworkInterface {
   batchQuery(requests: Request[]): Promise<ExecutionResult[]>;
-}
-
-export interface ReactiveNetworkInterface {
-  [others: string]: any;
-  query(request: Request): Observable<GraphQLResult>;
 }
 
 // XXX why does this have to extend network interface? does it even have a 'query' function?
@@ -249,11 +251,6 @@ export class HTTPFetchNetworkInterface extends BaseNetworkInterface {
   }
 }
 
-// This import has to be placed here due to a bug in TypeScript:
-// https://github.com/Microsoft/TypeScript/issues/21
-import {
-  WebsocketNetworkInterface,
-} from './websocketNetworkInterface';
 export interface NetworkInterfaceOptions {
   uri?: string;
   opts?: RequestInit;
@@ -262,7 +259,7 @@ export interface NetworkInterfaceOptions {
 export function createNetworkInterface(
   uriOrInterfaceOpts: string | NetworkInterfaceOptions,
   secondArgOpts: NetworkInterfaceOptions = {},
-): HTTPNetworkInterface {
+): NetworkInterface {
   if (! uriOrInterfaceOpts) {
     throw new Error('You must pass an options argument to createNetworkInterface.');
   }
@@ -281,24 +278,16 @@ as of Apollo Client 0.5. Please pass it as the "uri" property of the network int
     opts = uriOrInterfaceOpts.opts;
     uri = uriOrInterfaceOpts.uri;
   }
-  return new HTTPFetchNetworkInterface(uri, opts);
-}
 
-export function createReactiveNetworkInterface(
-    interfaceOpts: NetworkInterfaceOptions
-): ReactiveNetworkInterface {
-    if ( !interfaceOpts ) {
-        throw new Error('A remote enpdoint is required for a network layer');
-    }
-    const {
-      transportBatching = false,
-      opts = {},
-      uri,
-    } = interfaceOpts as NetworkInterfaceOptions;
+  if (!uri) {
+    throw new Error('A remote endpoint is required for a network layer');
+  }
 
-    if (transportBatching) {
-      throw new Error('transportBatching is not supported');
-    }
-
-    return new WebsocketNetworkInterface(uri, opts);
+  var parser = urlParse(uri);
+  switch(parser.protocol) {
+    case null: return new HTTPFetchNetworkInterface(uri, opts);
+    case 'http:': return new HTTPFetchNetworkInterface(uri, opts);
+    case 'ws:': return new WebsocketNetworkInterface(uri, opts);
+    default: throw new Error(`protocol ${parser.protocol}// is not supported.`);
+  }
 }
